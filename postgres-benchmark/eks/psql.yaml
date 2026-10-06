@@ -1,0 +1,1171 @@
+# PostgreSQL + io2 EBS + suspended benchmark CronJobs. Create postgres-auth first; see README.md.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: postgres-benchmark
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: postgres-io2
+provisioner: ebs.csi.aws.com
+parameters:
+  type: io2
+  iops: '32000'
+  encrypted: 'true'
+  csi.storage.k8s.io/fstype: ext4
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+  namespace: postgres-benchmark
+data:
+  postgresql.conf: |
+    port = 5432
+    listen_addresses = '*'
+    password_encryption = 'scram-sha-256'
+    max_connections = 2000
+    shared_preload_libraries = 'pg_stat_statements'
+    pg_stat_statements.max = 20000
+    pg_stat_statements.track = 'all'
+    track_io_timing = on
+    track_wal_io_timing = on
+    shared_buffers = '12GB'
+    effective_cache_size = '36GB'
+    maintenance_work_mem = '2GB'
+    work_mem = '8MB'
+    autovacuum = on
+    autovacuum_max_workers = 8
+    autovacuum_naptime = '15s'
+    autovacuum_vacuum_scale_factor = 0.02
+    autovacuum_analyze_scale_factor = 0.01
+    autovacuum_vacuum_cost_limit = 5000
+    autovacuum_work_mem = '512MB'
+    wal_buffers = '256MB'
+    wal_level = 'minimal'
+    max_wal_senders = 0
+    max_wal_size = '32GB'
+    min_wal_size = '8GB'
+    checkpoint_timeout = '30min'
+    checkpoint_completion_target = 0.9
+    random_page_cost = 1.0
+    effective_io_concurrency = 512
+    maintenance_io_concurrency = 512
+    synchronous_commit = off
+    commit_delay = 0
+    commit_siblings = 0
+    max_worker_processes = 32
+    max_parallel_workers = 16
+    max_parallel_workers_per_gather = 4
+    log_min_duration_statement = -1
+    log_checkpoints = on
+    logging_collector = off
+    log_min_messages = 'warning'
+    log_destination = 'stderr'
+  10-monitor.sh: |
+    #!/bin/sh
+    set -eu
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --set=monitor_password="$MONITOR_PASSWORD" <<'SQL'
+    CREATE ROLE postgres_metrics LOGIN PASSWORD :'monitor_password';
+    GRANT pg_monitor TO postgres_metrics;
+    CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+    SQL
+  queries.yml: |
+    pg_wal_io:
+      query: "SELECT wal_write_time / 1000.0 AS write_seconds, wal_sync_time / 1000.0 AS sync_seconds FROM pg_stat_wal"
+      metrics:
+        - write_seconds:
+            usage: COUNTER
+            description: Time spent writing WAL in seconds
+        - sync_seconds:
+            usage: COUNTER
+            description: Time spent syncing WAL in seconds
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: benchmark-scripts
+  namespace: postgres-benchmark
+data:
+  monitor-cgroup.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    while :; do
+      date -u +%FT%TZ
+      # Raw cumulative counters: CPU delta / time; memory.current is bytes.
+      for file in cpu.max cpu.stat memory.current memory.max memory.stat io.stat; do
+        if [ -r "/sys/fs/cgroup/$file" ]; then
+          echo "[$file]"
+          cat "/sys/fs/cgroup/$file"
+        fi
+      done
+      # EKS nodes on cgroup v1: preserve their equivalent counters.
+      for file in cpuacct/cpuacct.usage memory/memory.usage_in_bytes blkio/blkio.throttle.io_service_bytes; do
+        if [ -r "/sys/fs/cgroup/$file" ]; then
+          echo "[$file]"
+          cat "/sys/fs/cgroup/$file"
+        fi
+      done
+      sleep 1
+    done
+  monitor_db.sh: |
+    #!/usr/bin/env bash
+    # Uses the same PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSFILE/SSL settings as the benchmark.
+    set -euo pipefail
+    umask 077
+    export PGOPTIONS="${PGOPTIONS:-} -c statement_timeout=3000" PGAPPNAME=benchmark_monitor
+    while :; do
+      psql -X -At -v ON_ERROR_STOP=1 -c "SELECT json_build_object('time',clock_timestamp(),'database',(SELECT row_to_json(d) FROM pg_stat_database d WHERE datname=current_database()),'wal',(SELECT row_to_json(w) FROM pg_stat_wal w),'pgbench_waits',(SELECT coalesce(json_agg(a),'[]'::json) FROM (SELECT state,wait_event_type,wait_event,count(*) FROM pg_stat_activity WHERE datname=current_database() AND usename=current_user AND application_name='pgbench' GROUP BY state,wait_event_type,wait_event) a))::jsonb;"
+      sleep "${INTERVAL:-5}"
+    done
+  pg_bench_20idx.sh: |
+    #!/usr/bin/env bash
+    # =============================================================================
+    # pg_bench_20idx.sh - Do TPS thuc te cua PostgreSQL voi 1 bang 20 index
+    #
+    # Workload: INSERT + UPDATE ngau nhien chay dong thoi (pgbench custom script)
+    #   40%  insert         : them 1 dong moi (cap nhat ca 20 index)
+    #   40%  update_indexed : sua cot co index  (non-HOT, phai cap nhat index)
+    #   20%  update_hot     : sua cot khong co index (HOT, khong dung toi index)
+    #
+    # Cach dung:
+    #   export PGHOST=... PGPORT=5432 PGUSER=... PGPASSWORD=... PGDATABASE=...
+    #   ./pg_bench_20idx.sh init     # tao bang + nap du lieu + tao 20 index
+    #   ./pg_bench_20idx.sh run      # chay benchmark, in bang TPS
+    #   ./pg_bench_20idx.sh clean    # xoa bang test
+    #   ./pg_bench_20idx.sh all      # init + run (khong xoa)
+    #
+    # Tham so (bien moi truong):
+    #   ROWS=2000000        so dong nap ban dau
+    #   DURATION=120        so giay moi lan chay
+    #   CLIENTS="1 16 64"   cac muc so ket noi dong thoi, chay lan luot
+    #   W_INSERT=40 W_UPDATE_IDX=40 W_UPDATE_HOT=20   ty le workload
+    #   OUTDIR=./pgbench-results
+    #
+    # Yeu cau: psql va pgbench (goi postgresql-client / postgresql-contrib).
+    # Luu y: bai test tao tai ghi nang. Khong chay tren database dang phuc vu
+    #        production trong gio cao diem.
+    # =============================================================================
+    set -euo pipefail
+
+    ROWS="${ROWS:-2000000}"
+    DURATION="${DURATION:-120}"
+    CLIENTS="${CLIENTS:-1 16 64}"
+    W_INSERT="${W_INSERT:-40}"
+    W_UPDATE_IDX="${W_UPDATE_IDX:-40}"
+    W_UPDATE_HOT="${W_UPDATE_HOT:-20}"
+    OUTDIR="${OUTDIR:-./pgbench-results}"
+    TABLE="bench_orders_20idx"
+
+    PSQL=(psql -X -v ON_ERROR_STOP=1 -q)
+
+    need() { command -v "$1" >/dev/null 2>&1 || { echo "Thieu lenh: $1" >&2; exit 1; }; }
+    log()  { echo "[$(date +%H:%M:%S)] $*"; }
+
+    # -----------------------------------------------------------------------------
+    do_init() {
+      need psql
+      log "Tao bang ${TABLE} va nap ${ROWS} dong..."
+      "${PSQL[@]}" -v rows="${ROWS}" <<'SQL'
+    DROP TABLE IF EXISTS bench_orders_20idx;
+
+    CREATE TABLE bench_orders_20idx (
+        id           bigserial PRIMARY KEY,                -- index 1: btree (PK)
+        user_id      bigint        NOT NULL,
+        account_id   bigint        NOT NULL,
+        order_no     text          NOT NULL,
+        status       smallint      NOT NULL,
+        side         smallint      NOT NULL,
+        symbol       text          NOT NULL,
+        price        numeric(20,8) NOT NULL,
+        amount       numeric(20,8) NOT NULL,
+        filled       numeric(20,8) NOT NULL DEFAULT 0,
+        fee          numeric(20,8) NOT NULL DEFAULT 0,     -- khong co index
+        version      integer       NOT NULL DEFAULT 0,     -- khong co index
+        ref_code     text          NOT NULL,
+        note         text          NOT NULL,
+        tags         text[]        NOT NULL,
+        meta         jsonb         NOT NULL,
+        ip           inet          NOT NULL,
+        client_uuid  uuid          NOT NULL,
+        created_at   timestamptz   NOT NULL,
+        updated_at   timestamptz   NOT NULL,
+        expires_at   timestamptz   NOT NULL
+    ) WITH (fillfactor = 85);
+
+    -- Nap du lieu truoc, tao index sau cho nhanh.
+    INSERT INTO bench_orders_20idx
+        (user_id, account_id, order_no, status, side, symbol, price, amount,
+         ref_code, note, tags, meta, ip, client_uuid,
+         created_at, updated_at, expires_at)
+    SELECT
+        (random() * 199999)::bigint + 1,
+        (random() * 499999)::bigint + 1,
+        'ORD-' || g,
+        (random() * 3)::int,
+        (random())::int,
+        'SYM' || ((random() * 49)::int + 1),
+        round((random() * 100000)::numeric, 8),
+        round((random() * 10000)::numeric, 8),
+        'RC' || upper(substr(md5(g::text), 1, 10)),
+        'note ' || md5((g * 7)::text),
+        ARRAY['t' || (g % 20), 't' || ((g / 20) % 20)],
+        jsonb_build_object('src', g % 5, 'k', g % 1000, 'u', g % 200000),
+        '0.0.0.0'::inet + (random() * 2147483647)::bigint,
+        md5(g::text || 'u')::uuid,
+        now() - ((:rows - g) * interval '1 second'),
+        now() - (random() * interval '30 days'),
+        now() + (random() * interval '30 days')
+    FROM generate_series(1, :rows) AS g;
+
+    -- ---- 19 index con lai (cong PK = 20) ---------------------------------------
+    -- btree thuong
+    CREATE UNIQUE INDEX b20_order_no_uq    ON bench_orders_20idx (order_no);                          -- 2
+    CREATE INDEX b20_user_id               ON bench_orders_20idx (user_id);                           -- 3
+    CREATE INDEX b20_updated_at            ON bench_orders_20idx (updated_at);                        -- 4
+    CREATE INDEX b20_amount_desc           ON bench_orders_20idx (amount DESC NULLS LAST);            -- 5
+    -- btree nhieu cot
+    CREATE INDEX b20_user_created          ON bench_orders_20idx (user_id, created_at DESC);          -- 6
+    CREATE INDEX b20_symbol_status_created ON bench_orders_20idx (symbol, status, created_at);        -- 7
+    CREATE INDEX b20_symbol_price          ON bench_orders_20idx (symbol, price);                     -- 8
+    -- btree covering (INCLUDE)
+    CREATE INDEX b20_account_cover         ON bench_orders_20idx (account_id)
+                                              INCLUDE (amount, filled, status);                       -- 9
+    -- partial index
+    CREATE INDEX b20_open_orders           ON bench_orders_20idx (user_id, symbol) WHERE status = 0;  -- 10
+    CREATE INDEX b20_expiring              ON bench_orders_20idx (expires_at) WHERE status IN (0, 1); -- 11
+    -- expression index
+    CREATE INDEX b20_ref_lower             ON bench_orders_20idx (lower(ref_code));                   -- 12
+    CREATE INDEX b20_created_day           ON bench_orders_20idx
+                                              (((created_at AT TIME ZONE 'UTC')::date));              -- 13
+    -- hash
+    CREATE INDEX b20_client_uuid_hash      ON bench_orders_20idx USING hash (client_uuid);            -- 14
+    -- GIN
+    CREATE INDEX b20_meta_gin              ON bench_orders_20idx USING gin (meta jsonb_path_ops);     -- 15
+    CREATE INDEX b20_tags_gin              ON bench_orders_20idx USING gin (tags);                    -- 16
+    -- BRIN
+    CREATE INDEX b20_created_brin          ON bench_orders_20idx USING brin (created_at);             -- 17
+    -- GiST
+    CREATE INDEX b20_ip_gist               ON bench_orders_20idx USING gist (ip inet_ops);            -- 18
+    -- SP-GiST
+    CREATE INDEX b20_ref_spgist            ON bench_orders_20idx USING spgist (ref_code);             -- 19
+
+    -- 20: GIN trigram neu co pg_trgm, khong thi dung btree text_pattern_ops
+    DO $$
+    BEGIN
+        BEGIN
+            CREATE EXTENSION IF NOT EXISTS pg_trgm;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Khong tao duoc pg_trgm (%), dung btree text_pattern_ops cho cot note', SQLERRM;
+        END;
+        IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm') THEN
+            EXECUTE 'CREATE INDEX b20_note_trgm ON bench_orders_20idx USING gin (note gin_trgm_ops)';
+        ELSE
+            EXECUTE 'CREATE INDEX b20_note_pattern ON bench_orders_20idx (note text_pattern_ops)';
+        END IF;
+    END $$;
+
+    VACUUM ANALYZE bench_orders_20idx;
+    SQL
+      log "Xong. Danh sach index:"
+      show_size
+    }
+
+    # -----------------------------------------------------------------------------
+    show_size() {
+      psql -X -c "
+        SELECT count(*)                                          AS so_index,
+               pg_size_pretty(pg_table_size('${TABLE}'))         AS bang,
+               pg_size_pretty(pg_indexes_size('${TABLE}'))       AS tong_index,
+               pg_size_pretty(pg_total_relation_size('${TABLE}')) AS tong
+        FROM pg_indexes WHERE tablename = '${TABLE}';"
+    }
+
+    show_settings() {
+      psql -X -c "
+        SELECT name, setting, unit FROM pg_settings
+        WHERE name IN ('server_version','shared_buffers','synchronous_commit','fsync',
+                       'full_page_writes','wal_level','wal_compression','max_wal_size',
+                       'checkpoint_timeout','synchronous_standby_names','max_connections')
+        ORDER BY name;"
+    }
+
+    write_scripts() {
+      local d="$1"
+
+      cat > "${d}/insert.sql" <<'SQL'
+    \set uid   random(1, 200000)
+    \set acc   random(1, 500000)
+    \set sym   random(1, 50)
+    \set st    random(0, 3)
+    \set side  random(0, 1)
+    \set price random(1, 10000000)
+    \set amt   random(1, 1000000)
+    \set ipn   random(0, 2147483647)
+    INSERT INTO bench_orders_20idx
+        (user_id, account_id, order_no, status, side, symbol, price, amount,
+         ref_code, note, tags, meta, ip, client_uuid,
+         created_at, updated_at, expires_at)
+    VALUES
+        (:uid, :acc,
+         'ORD-' || md5(random()::text || clock_timestamp()::text),
+         :st, :side, 'SYM' || :sym, :price / 100.0, :amt / 100.0,
+         'RC' || upper(substr(md5(random()::text), 1, 10)),
+         'note ' || md5(random()::text),
+         ARRAY['t' || (:uid % 20), 't' || (:acc % 20)],
+         jsonb_build_object('src', :side, 'k', :amt % 1000, 'u', :uid),
+         '0.0.0.0'::inet + :ipn,
+         md5(random()::text || clock_timestamp()::text)::uuid,
+         now(), now(), now() + interval '7 days');
+    SQL
+
+      cat > "${d}/update_indexed.sql" <<'SQL'
+    \set id random(1, :maxid)
+    \set st random(0, 3)
+    \set f  random(0, 1000000)
+    UPDATE bench_orders_20idx
+       SET status     = :st,
+           filled     = :f / 100.0,
+           updated_at = now(),
+           meta       = meta || jsonb_build_object('k', :f % 1000)
+     WHERE id = :id;
+    SQL
+
+      cat > "${d}/update_hot.sql" <<'SQL'
+    \set id random(1, :maxid)
+    \set f  random(0, 1000000)
+    UPDATE bench_orders_20idx
+       SET fee     = :f / 1000.0,
+           version = version + 1
+     WHERE id = :id;
+    SQL
+    }
+
+    # -----------------------------------------------------------------------------
+    do_run() {
+      need psql; need pgbench
+      mkdir -p "${OUTDIR}"
+      local work; work="$(mktemp -d)"
+      trap 'rm -rf "${work}"' RETURN
+      write_scripts "${work}"
+
+      local maxid
+      maxid="$(psql -X -At -c "SELECT max(id) FROM ${TABLE}")"
+      [ -n "${maxid}" ] || { echo "Bang ${TABLE} chua co du lieu. Chay 'init' truoc." >&2; exit 1; }
+
+      local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
+      local summary="${OUTDIR}/summary-${stamp}.txt"
+      local ncpu; ncpu="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+
+      {
+        echo "=== pg_bench_20idx ${stamp} ==="
+        echo "Host: ${PGHOST:-local}  DB: ${PGDATABASE:-}  Rows ban dau: ${maxid}"
+        echo "Workload: insert ${W_INSERT}% / update_indexed ${W_UPDATE_IDX}% / update_hot ${W_UPDATE_HOT}%"
+        echo "Moi lan chay: ${DURATION}s"
+        echo
+        show_settings
+        show_size
+      } | tee "${summary}"
+
+      printf '\n%-8s %12s %14s %14s %12s\n' "clients" "TPS" "lat_avg(ms)" "lat_stddev" "WAL(MB/s)" | tee -a "${summary}"
+
+      local c
+      for c in ${CLIENTS}; do
+        local threads=$(( c < ncpu ? c : ncpu ))
+        local out="${OUTDIR}/run-${stamp}-c${c}.txt"
+
+        psql -X -q -c "CHECKPOINT" 2>/dev/null || true   # can quyen; bo qua neu khong co
+        local lsn0; lsn0="$(psql -X -At -c "SELECT pg_current_wal_lsn()")"
+
+        log "Chay ${c} client trong ${DURATION}s..." >&2
+        pgbench -n \
+          -f "${work}/insert.sql@${W_INSERT}" \
+          -f "${work}/update_indexed.sql@${W_UPDATE_IDX}" \
+          -f "${work}/update_hot.sql@${W_UPDATE_HOT}" \
+          -D maxid="${maxid}" \
+          -c "${c}" -j "${threads}" -T "${DURATION}" -P 10 -r \
+          > "${out}" 2>&1 || { echo "pgbench loi, xem ${out}" >&2; tail -20 "${out}" >&2; exit 1; }
+
+        local wal_mb
+        wal_mb="$(psql -X -At -c "SELECT round(pg_wal_lsn_diff(pg_current_wal_lsn(), '${lsn0}') / 1024.0 / 1024.0 / ${DURATION}, 2)")"
+
+        local tps lat sd
+        tps="$(awk '/^tps = /{print $3; exit}' "${out}")"
+        lat="$(awk -F'= ' '/^latency average/{print $2; exit}' "${out}" | awk '{print $1}')"
+        sd="$(awk -F'= ' '/^latency stddev/{print $2; exit}' "${out}" | awk '{print $1}')"
+        printf '%-8s %12s %14s %14s %12s\n' "${c}" "${tps:-?}" "${lat:-?}" "${sd:-?}" "${wal_mb:-?}" | tee -a "${summary}"
+      done
+
+      {
+        echo
+        echo "Kich thuoc sau khi test:"
+        show_size
+      } | tee -a "${summary}"
+
+      echo
+      log "Tom tat: ${summary}"
+      log "Chi tiet tung lan chay (TPS moi 10s, latency tung loai lenh): ${OUTDIR}/run-${stamp}-c*.txt"
+    }
+
+    # -----------------------------------------------------------------------------
+    do_clean() {
+      need psql
+      psql -X -q -c "DROP TABLE IF EXISTS ${TABLE}"
+      log "Da xoa bang ${TABLE}."
+    }
+
+    case "${1:-}" in
+      init)  do_init ;;
+      run)   do_run ;;
+      clean) do_clean ;;
+      all)   do_init; do_run ;;
+      *)     sed -n '2,29p' "$0"; exit 1 ;;
+    esac
+  run-fio.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    umask 077
+    root="${BENCHMARK_VOLUME:-/var/lib/postgresql/data}"
+    scripts="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+    size="${FIO_SIZE:-10G}"
+    fsync_size="${FIO_FSYNC_SIZE:-2G}"
+    runtime="${FIO_RUNTIME:-60}"
+    mixed_runtime="${FIO_MIXED_RUNTIME:-300}"
+    minimum_free="${FIO_MIN_FREE_BYTES:-55834574848}"
+    for value in "$runtime" "$mixed_runtime" "$minimum_free"; do
+      [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo 'Durations/free-space threshold must be positive integers' >&2; exit 1; }
+    done
+    for value in "$size" "$fsync_size"; do
+      [[ "$value" =~ ^[1-9][0-9]*[MG]$ ]] || { echo 'File sizes must use integer M or G' >&2; exit 1; }
+    done
+    exec 9> "$root/.benchmark.lock"
+    echo 'Waiting for shared benchmark lock (fio)'
+    flock -w 1800 9
+    free="$(df -B1 --output=avail "$root" | tail -1 | tr -d ' ')"
+    [ "$free" -ge "$minimum_free" ] || { echo "Need at least $minimum_free free bytes; found $free" >&2; exit 1; }
+    mkdir -p "$root/benchmark-results"
+    result="$(mktemp -d "$root/benchmark-results/fio-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
+    scratch="$(mktemp -d "$root/.fio-XXXXXX")"
+    monitor_pid=''
+    finish() {
+      code=$?
+      trap - EXIT
+      set +e
+      if [ -n "$monitor_pid" ]; then kill "$monitor_pid" 2>/dev/null; wait "$monitor_pid" 2>/dev/null; fi
+      rm -rf -- "$scratch"
+      echo "$code" > "$result/exit-code.txt"
+      echo "Results: $result (exit $code; scratch files removed)"
+      exit "$code"
+    }
+    trap finish EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    { date -u +%FT%TZ; fio --version; df -h "$root"; cat /proc/self/mountinfo; } > "$result/environment.txt"
+    bash "$scripts/monitor-cgroup.sh" > "$result/container-resources.log" &
+    monitor_pid="$!"
+    common=(--directory="$scratch" '--filename_format=fio.$jobnum' --ioengine=libaio --direct=1 --size="$size" --iodepth=32 --numjobs=4 --group_reporting --output-format=json)
+    run() {
+      name="$1"; shift
+      echo "[$(date -u +%FT%TZ)] $name"
+      # Keep diagnostics on stderr separate from the JSON report.
+      # --output merges some fio diagnostics into the JSON file.
+      fio --name="$name" "$@" > "$result/$name.json" 2> "$result/$name.stderr.log"
+      cat "$result/$name.stderr.log" >&2
+    }
+    # Write every block first: random reads must not measure sparse/unwritten extents.
+    run prepare "${common[@]}" --rw=write --bs=1M --end_fsync=1
+    run randread-4k "${common[@]}" --rw=randread --bs=4k --runtime="$runtime" --time_based
+    run randwrite-4k "${common[@]}" --rw=randwrite --bs=4k --runtime="$runtime" --time_based
+    run randread-8k "${common[@]}" --rw=randread --bs=8k --runtime="$runtime" --time_based
+    run randwrite-8k "${common[@]}" --rw=randwrite --bs=8k --runtime="$runtime" --time_based
+    run fsync-test --directory="$scratch" --filename=fsync.bin --ioengine=sync --rw=write --bs=8k --size="$fsync_size" --fdatasync=1 --runtime="$runtime" --time_based --output-format=json
+    run mixed "${common[@]}" --rw=randrw --rwmixread=70 --bs=8k --runtime="$mixed_runtime" --time_based
+  run-job.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mode="${1:?Expected off or on}"
+    case "$mode" in off|on) ;; *) exit 1;; esac
+    namespace="${POD_NAMESPACE:?}"
+    ready=false
+    for ((attempt=0; attempt<60; attempt++)); do
+      if [ "$(kubectl get pod postgres-0 -n "$namespace" -o jsonpath='{.status.containerStatuses[?(@.name=="postgres")].ready}')" = true ]; then
+        ready=true; break
+      fi
+      sleep 5
+    done
+    [ "$ready" = true ] || { echo 'postgres-0 was not ready within 300 seconds' >&2; exit 1; }
+    exec kubectl exec -n "$namespace" postgres-0 -c postgres -- bash /opt/benchmark/run-pg.sh "$mode"
+  run-pg.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    umask 077
+    mode="${1:?Expected off or on}"
+    case "$mode" in off|on) ;; *) echo 'Expected off or on' >&2; exit 1;; esac
+    root="${BENCHMARK_VOLUME:-/var/lib/postgresql/data}"
+    scripts="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+    exec 9> "$root/.benchmark.lock"
+    echo "Waiting for shared benchmark lock ($mode)"
+    flock -w 1800 9
+    unset PGOPTIONS PGSERVICE PGSERVICEFILE PGPASSFILE
+    export PGHOST=127.0.0.1 PGPORT=5432 PGUSER=postgres PGDATABASE=postgres PGSSLMODE=disable
+    export PGPASSWORD="$(cat "${POSTGRES_PASSWORD_FILE:?}")"
+    mkdir -p "$root/benchmark-results"
+    result="$(mktemp -d "$root/benchmark-results/pg-$mode-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
+    export RESULTS_ROOT="$result"
+    monitor_pids=()
+    finish() {
+      code=$?
+      trap - EXIT
+      set +e
+      for pid in "${monitor_pids[@]}"; do kill "$pid" 2>/dev/null; done
+      for pid in "${monitor_pids[@]}"; do wait "$pid" 2>/dev/null; done
+      # Flush pending cleanup writes before the next workload gets the lock.
+      psql -X -v ON_ERROR_STOP=1 -c CHECKPOINT >> "$result/checkpoint.log" 2>&1
+      checkpoint_code=$?
+      if [ "$code" -eq 0 ]; then code=$checkpoint_code; fi
+      echo "$code" > "$result/exit-code.txt"
+      echo "Results: $result (exit $code)"
+      exit "$code"
+    }
+    trap finish EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    {
+      date -u +%FT%TZ
+      pgbench --version
+      psql -X -At -c 'SELECT version(); SHOW synchronous_commit; SHOW fsync; SHOW full_page_writes;'
+      df -h "$root"
+      cat /proc/self/mountinfo
+    } > "$result/environment.txt"
+    bash "$scripts/monitor_db.sh" > "$result/database.jsonl" 2> "$result/database-monitor.log" &
+    monitor_pids+=("$!")
+    bash "$scripts/monitor-cgroup.sh" > "$result/container-resources.log" &
+    monitor_pids+=("$!")
+    bash "$scripts/run_commit_modes.sh" "$mode" 2>&1 | tee "$result/console.log"
+  run_commit_modes.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    umask 077
+    BENCHMARK="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/pg_bench_20idx.sh"
+    for cmd in psql pgbench; do command -v "$cmd" >/dev/null || { echo "Missing $cmd" >&2; exit 1; }; done
+    export ROWS="${ROWS:-2000000}" DURATION="${DURATION:-120}" CLIENTS="${CLIENTS:-1 16 64}"
+    [[ "$ROWS" =~ ^[1-9][0-9]*$ && "$DURATION" =~ ^[1-9][0-9]*$ ]] || { echo 'ROWS and DURATION must be positive integers' >&2; exit 1; }
+    for c in $CLIENTS; do [[ "$c" =~ ^[1-9][0-9]*$ ]] || { echo 'CLIENTS must contain positive integers' >&2; exit 1; }; done
+    [[ -n "$CLIENTS" ]] || { echo 'CLIENTS is empty' >&2; exit 1; }
+    if [ "$#" -eq 0 ]; then set -- off local on; fi
+    seen_modes=" "
+    for mode in "$@"; do
+      [[ "$seen_modes" != *" $mode "* ]] || { echo "Duplicate mode: $mode" >&2; exit 1; }
+      seen_modes+="$mode "
+      case "$mode" in off|local|on|remote_write|remote_apply) ;; *) echo "Unknown commit mode: $mode" >&2; exit 1;; esac
+    done
+    base_options="${PGOPTIONS:-} -c search_path=public"
+    export PGOPTIONS="$base_options"
+    SQL=(psql -X -At -v ON_ERROR_STOP=1)
+    check_absent() {
+      [ "$("${SQL[@]}" -c "SELECT to_regclass('public.bench_orders_20idx') IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off' AND has_schema_privilege(current_user,'public','USAGE') AND has_schema_privilege(current_user,'public','CREATE')")" = t ] || {
+        echo 'Requires writable primary, USAGE/CREATE on public, and no existing public.bench_orders_20idx' >&2; exit 1;
+      }
+    }
+    check_absent
+    had_trgm="$("${SQL[@]}" -c "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='pg_trgm')")"
+    mkdir -p "${RESULTS_ROOT:-./pgbench-results}"
+    run_dir="$(mktemp -d "${RESULTS_ROOT:-./pgbench-results}/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
+    run_dir="$(cd "$run_dir" && pwd)"
+    owned_table=0
+    finish() {
+      code=$?
+      trap - EXIT
+      set +e
+      if [ "$owned_table" -eq 1 ]; then
+        "$BENCHMARK" clean >> "$run_dir/cleanup-on-exit.log" 2>&1
+        cleanup_code=$?; [ "$cleanup_code" -eq 0 ] || code=$cleanup_code
+      fi
+      if [ "$had_trgm" = f ]; then
+        "${SQL[@]}" -c "DO \$\$ BEGIN IF EXISTS(SELECT 1 FROM pg_extension WHERE extname='pg_trgm' AND extowner=(SELECT oid FROM pg_roles WHERE rolname=current_user)) THEN DROP EXTENSION pg_trgm; END IF; END \$\$;" >> "$run_dir/extension-cleanup.log" 2>&1
+        cleanup_code=$?; [ "$cleanup_code" -eq 0 ] || code=$cleanup_code
+      fi
+      echo "Results: $run_dir (exit $code)"
+      exit "$code"
+    }
+    trap finish EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    for mode in "$@"; do
+      export PGOPTIONS="$base_options -c synchronous_commit=$mode" OUTDIR="$run_dir/$mode"
+      [ ! -e "$OUTDIR" ] || { echo "Duplicate mode: $mode" >&2; exit 1; }
+      mkdir "$OUTDIR"
+      check_absent
+      "${SQL[@]}" -c 'SHOW synchronous_commit' > "$OUTDIR/synchronous-commit.txt"
+      grep -qx "$mode" "$OUTDIR/synchronous-commit.txt"
+      echo "[$(date +%T)] $mode: init $ROWS rows"
+      date -u +%FT%TZ > "$OUTDIR/start-utc.txt"
+      owned_table=1
+      "$BENCHMARK" init > "$OUTDIR/init.log" 2>&1
+      "${SQL[@]}" -c "SELECT json_build_object('rows',count(*),'indexes',(SELECT count(*) FROM pg_index WHERE indrelid='public.bench_orders_20idx'::regclass),'trgm',to_regclass('public.b20_note_trgm') IS NOT NULL) FROM public.bench_orders_20idx" > "$OUTDIR/initial-count.json"
+      [ "$("${SQL[@]}" -c "SELECT count(*)=$ROWS AND (SELECT count(*) FROM pg_index WHERE indrelid='public.bench_orders_20idx'::regclass)=20 AND to_regclass('public.b20_note_trgm') IS NOT NULL FROM public.bench_orders_20idx")" = t ] || { echo 'Expected ROWS rows and all 20 indexes including GIN trigram; see init.log' >&2; exit 1; }
+      "$BENCHMARK" run 2>&1 | tee "$OUTDIR/run.log"
+      "$BENCHMARK" clean > "$OUTDIR/clean.log" 2>&1
+      check_absent
+      owned_table=0
+      echo t > "$OUTDIR/cleanup-verified.txt"
+      date -u +%FT%TZ > "$OUTDIR/end-utc.txt"
+    done
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: postgres-benchmark
+spec:
+  selector:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: postgres-ebs-test
+  ports:
+  - name: postgres
+    port: 5432
+    targetPort: postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: postgres-benchmark
+spec:
+  selector:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: postgres-ebs-test
+  ports:
+  - name: postgres
+    port: 5432
+    targetPort: postgres
+  clusterIP: None
+  publishNotReadyAddresses: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-exporter
+  namespace: postgres-benchmark
+  annotations:
+    prometheus.io/scrape: 'true'
+    prometheus.io/port: '9187'
+    prometheus.io/path: /metrics
+spec:
+  selector:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: postgres-ebs-test
+  ports:
+  - name: metrics
+    port: 9187
+    targetPort: metrics
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: postgres-benchmark
+spec:
+  serviceName: postgres-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+      app.kubernetes.io/part-of: postgres-ebs-test
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: postgres-ebs-test
+      annotations:
+        sidecar.istio.io/inject: 'false'
+    spec:
+      nodeSelector:
+        remi: debug
+        kubernetes.io/os: linux
+        kubernetes.io/arch: amd64
+      tolerations:
+      - key: remi
+        operator: Equal
+        value: debug
+        effect: NoSchedule
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: postgres
+        image: postgres:16@sha256:65b16a8b326e0cfbdf33fa7e783f2a0cb352a61448616ccccfd616ef42aa0f65
+        imagePullPolicy: IfNotPresent
+        args:
+        - postgres
+        - -c
+        - config_file=/etc/postgresql/postgresql.conf
+        env:
+        - name: POSTGRES_USER
+          value: postgres
+        - name: POSTGRES_DB
+          value: postgres
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        - name: POSTGRES_INITDB_ARGS
+          value: --auth-host=scram-sha-256 --auth-local=trust
+        - name: POSTGRES_HOST_AUTH_METHOD
+          value: scram-sha-256
+        - name: POSTGRES_PASSWORD_FILE
+          value: /run/postgres-secrets/postgres-password
+        - name: MONITOR_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-auth
+              key: monitor-password
+        ports:
+        - name: postgres
+          containerPort: 5432
+        resources:
+          requests:
+            cpu: '24'
+            memory: 48Gi
+          limits:
+            cpu: '24'
+            memory: 48Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+        - name: config
+          mountPath: /etc/postgresql
+          readOnly: true
+        - name: init
+          mountPath: /docker-entrypoint-initdb.d
+          readOnly: true
+        - name: auth
+          mountPath: /run/postgres-secrets
+          readOnly: true
+        - name: shm
+          mountPath: /dev/shm
+        - name: scripts
+          mountPath: /opt/benchmark
+          readOnly: true
+        startupProbe:
+          exec:
+            command:
+            - sh
+            - -ec
+            - pg_isready -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 90
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -ec
+            - pg_isready -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 6
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -ec
+            - pg_isready -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 6
+          initialDelaySeconds: 30
+      - name: postgres-exporter
+        image: quay.io/prometheuscommunity/postgres-exporter:v0.17.1
+        args:
+        - --collector.stat_statements
+        - --collector.long_running_transactions
+        - --extend.query-path=/etc/postgres-exporter/queries.yml
+        env:
+        - name: DATA_SOURCE_URI
+          value: 127.0.0.1:5432/postgres?sslmode=disable
+        - name: DATA_SOURCE_USER
+          value: postgres_metrics
+        - name: DATA_SOURCE_PASS_FILE
+          value: /run/postgres-secrets/monitor-password
+        ports:
+        - name: metrics
+          containerPort: 9187
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 100m
+            memory: 256Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: monitor-auth
+          mountPath: /run/postgres-secrets
+          readOnly: true
+        - name: config
+          mountPath: /etc/postgres-exporter
+          readOnly: true
+        readinessProbe:
+          httpGet:
+            path: /metrics
+            port: 9187
+          periodSeconds: 15
+          timeoutSeconds: 10
+          failureThreshold: 6
+        livenessProbe:
+          httpGet:
+            path: /metrics
+            port: 9187
+          periodSeconds: 15
+          timeoutSeconds: 10
+          failureThreshold: 6
+      volumes:
+      - name: config
+        configMap:
+          name: postgres-config
+      - name: init
+        configMap:
+          name: postgres-config
+          items:
+          - key: 10-monitor.sh
+            path: 10-monitor.sh
+          defaultMode: 365
+      - name: auth
+        secret:
+          secretName: postgres-auth
+          defaultMode: 288
+          items:
+          - key: postgres-password
+            path: postgres-password
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+      - name: monitor-auth
+        secret:
+          secretName: postgres-auth
+          defaultMode: 288
+          items:
+          - key: monitor-password
+            path: monitor-password
+      - name: scripts
+        configMap:
+          name: benchmark-scripts
+          defaultMode: 365
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: postgres-ebs-test
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      storageClassName: postgres-io2
+      resources:
+        requests:
+          storage: 100Gi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: benchmark-runner
+  namespace: postgres-benchmark
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: benchmark-runner
+  namespace: postgres-benchmark
+rules:
+- apiGroups:
+  - ''
+  resources:
+  - pods
+  resourceNames:
+  - postgres-0
+  verbs:
+  - get
+- apiGroups:
+  - ''
+  resources:
+  - pods/exec
+  resourceNames:
+  - postgres-0
+  verbs:
+  - get
+  - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: benchmark-runner
+  namespace: postgres-benchmark
+subjects:
+- kind: ServiceAccount
+  name: benchmark-runner
+  namespace: postgres-benchmark
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: benchmark-runner
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: pgbench-off
+  namespace: postgres-benchmark
+spec:
+  schedule: 0 0 * * *
+  timeZone: Asia/Ho_Chi_Minh
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 3600
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: pgbench-off
+            app.kubernetes.io/part-of: postgres-ebs-test
+          annotations:
+            sidecar.istio.io/inject: 'false'
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: true
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            fsGroup: 999
+            fsGroupChangePolicy: OnRootMismatch
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+          - name: benchmark
+            image: alpine/k8s:1.35.0@sha256:18bc02c1e0df04451f4f9194eb7b7341c1165da5495459b52f85f72fb9545032
+            command:
+            - /bin/bash
+            - /opt/benchmark/run-job.sh
+            resources:
+              requests:
+                cpu: 100m
+                memory: 64Mi
+              limits:
+                cpu: 500m
+                memory: 256Mi
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop:
+                - ALL
+            volumeMounts:
+            - name: scripts
+              mountPath: /opt/benchmark
+              readOnly: true
+            args:
+            - 'off'
+            env:
+            - name: HOME
+              value: /tmp
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumes:
+          - name: scripts
+            configMap:
+              name: benchmark-scripts
+              defaultMode: 365
+          terminationGracePeriodSeconds: 120
+          serviceAccountName: benchmark-runner
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: pgbench-on
+  namespace: postgres-benchmark
+spec:
+  schedule: 0 1 * * *
+  timeZone: Asia/Ho_Chi_Minh
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 3600
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: pgbench-on
+            app.kubernetes.io/part-of: postgres-ebs-test
+          annotations:
+            sidecar.istio.io/inject: 'false'
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: true
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            fsGroup: 999
+            fsGroupChangePolicy: OnRootMismatch
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+          - name: benchmark
+            image: alpine/k8s:1.35.0@sha256:18bc02c1e0df04451f4f9194eb7b7341c1165da5495459b52f85f72fb9545032
+            command:
+            - /bin/bash
+            - /opt/benchmark/run-job.sh
+            resources:
+              requests:
+                cpu: 100m
+                memory: 64Mi
+              limits:
+                cpu: 500m
+                memory: 256Mi
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop:
+                - ALL
+            volumeMounts:
+            - name: scripts
+              mountPath: /opt/benchmark
+              readOnly: true
+            args:
+            - 'on'
+            env:
+            - name: HOME
+              value: /tmp
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumes:
+          - name: scripts
+            configMap:
+              name: benchmark-scripts
+              defaultMode: 365
+          terminationGracePeriodSeconds: 120
+          serviceAccountName: benchmark-runner
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: fio-ebs
+  namespace: postgres-benchmark
+spec:
+  schedule: 0 2 * * *
+  timeZone: Asia/Ho_Chi_Minh
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 3600
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: fio-ebs
+            app.kubernetes.io/part-of: postgres-ebs-test
+          annotations:
+            sidecar.istio.io/inject: 'false'
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            fsGroup: 999
+            fsGroupChangePolicy: OnRootMismatch
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+          - name: benchmark
+            image: ghcr.io/kvaps/fio:3.38@sha256:a3af4aada7679913ea327ac8bb256a62596352b587cd418ea0e891ed8db372bd
+            command:
+            - /bin/bash
+            - /opt/benchmark/run-fio.sh
+            resources:
+              requests:
+                cpu: '4'
+                memory: 2Gi
+              limits:
+                cpu: '4'
+                memory: 2Gi
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop:
+                - ALL
+            volumeMounts:
+            - name: scripts
+              mountPath: /opt/benchmark
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          volumes:
+          - name: scripts
+            configMap:
+              name: benchmark-scripts
+              defaultMode: 365
+          - name: data
+            persistentVolumeClaim:
+              claimName: data-postgres-0
+          terminationGracePeriodSeconds: 120
+          nodeSelector:
+            remi: debug
+            kubernetes.io/os: linux
+            kubernetes.io/arch: amd64
+          tolerations:
+          - key: remi
+            operator: Equal
+            value: debug
+            effect: NoSchedule
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: postgres
+                    app.kubernetes.io/part-of: postgres-ebs-test
+                topologyKey: kubernetes.io/hostname
