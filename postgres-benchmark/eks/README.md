@@ -30,44 +30,49 @@ Karpenter không chọn IOPS EBS theo resource requests CPU/RAM; cần kiểm tr
 
 ## Nội dung psql.yaml
 
-File độc lập, đã nhúng toàn bộ script vào ConfigMap; chỉ cần copy `psql.yaml` và tạo Secret.
-`ebs.yaml` là bản riêng của cùng StorageClass để xem hoặc apply trước; không bắt buộc apply cả hai.
+File `psql.yaml` đã nhúng toàn bộ script vào ConfigMap, chỉ chứa workload trong namespace có sẵn.
+Namespace `postgres-benchmark`, StorageClass `postgres-io2` và Secret `postgres-auth` phải tồn tại trước.
+StorageClass nằm riêng trong `ebs.yaml`; admin apply một lần nếu chưa có.
 Không sửa file triển khai LPEX cũ.
 
-- Namespace `postgres-benchmark`, một StatefulSet `postgres`, một replica.
+- Dùng namespace `postgres-benchmark` có sẵn, một StatefulSet `postgres`, một replica.
 - PostgreSQL 16: request/limit **24 CPU / 48 GiB**, cùng cấu hình LPEX: `shared_buffers=12GB`, `effective_cache_size=36GB`, `synchronous_commit=off`, `fsync=on` và `full_page_writes=on` mặc định PostgreSQL.
 - Exporter sidecar trong cùng pod: 100m CPU / 256 MiB, metrics cổng 9187.
 - Hai PVC io2 riêng, mỗi PVC 100 GiB / 32.000 IOPS: data `data-postgres-0` và WAL `wal-postgres-0`.
 - PGDATA ở `/var/lib/postgresql/data/pgdata`; `POSTGRES_INITDB_WALDIR=/var/lib/postgresql/wal/pg_wal` tạo symlink `PGDATA/pg_wal` sang volume WAL riêng ngay lúc initdb.
-- Hai CronJob `pgbench-off`, `pgbench-on`: tạo 2 triệu dòng và 20 index, chạy lần lượt 1 / 16 / 64 clients, mỗi mức 120 giây, rồi xóa bảng test.
+- Hai CronJob `pgbench-off`, `pgbench-on`: pod client PostgreSQL 16 kết nối qua DNS Service, tạo 2 triệu dòng và 20 index, chạy lần lượt 1 / 16 / 64 clients, mỗi mức 120 giây, rồi xóa bảng test. Mỗi client request/limit 4 CPU / 2 GiB.
 - CronJob `fio-ebs`: chỉ mount PVC data, cùng node với PostgreSQL; đo ổ data bằng file tạm ngoài PGDATA. RWO cho phép nhiều pod cùng node mount volume.
-- Service nội bộ; không Ingress, certificate hoặc NetworkPolicy. Không thêm PgBouncer vào bài đo trực tiếp này.
+- Service nội bộ; không Ingress, certificate hoặc NetworkPolicy. Không thêm PgBouncer vào bài đo PG này.
 
-Các image chính được khóa digest. Image kubectl 1.35 phù hợp API server 1.34–1.36 theo chính sách lệch một minor.
-Nếu EKS dùng minor khác, thay image **cả hai CronJob SQL** bằng kubectl cùng minor EKS.
-[Version skew](https://kubernetes.io/releases/version-skew-policy/#kubectl).
+Các image chính được khóa digest. CronJob SQL dùng PostgreSQL 16 client, không dùng kubectl, không gọi Kubernetes API và không mount ServiceAccount token.
+
+## Quyền triển khai
+
+Đã bỏ `Namespace`, `StorageClass`, `ServiceAccount`, `Role` và `RoleBinding` khỏi `psql.yaml`.
+Các job SQL kết nối bằng user/password PostgreSQL qua Service DNS, nên không cần quyền `pods/exec` hay benchmark RBAC.
+Namespace đã có vẫn dùng `metadata.namespace: postgres-benchmark` trên từng workload.
+
+User deploy cần quyền quản lý ConfigMap, Service, StatefulSet, CronJob và Secret trong namespace; quyền chạy Job/xem pod/log dùng khi kích hoạt test.
+Nếu `postgres-io2` chưa tồn tại thì admin cần apply `ebs.yaml`; bỏ StorageClass khỏi workload không tự tạo volume class hay cấp quyền cluster.
 
 ## Apply
 
-Chạy bằng context EKS của Đại ca. Kiểm tra node và CSI trước:
+Dùng context EKS và namespace `postgres-benchmark` Đại ca đã tạo. Admin apply StorageClass nếu chưa có:
 
 ```bash
-kubectl config current-context
-kubectl get nodes -o wide
-kubectl -n kube-system get deployment ebs-csi-controller
-kubectl get csidriver ebs.csi.aws.com
-kubectl get nodepools
+kubectl apply -f ebs.yaml
 ```
 
-Không cần gắn label thủ công. Karpenter provision node phù hợp 24 CPU / 48 GiB cho PG; fio cần thêm 4 CPU / 2 GiB và có affinity bắt buộc cùng hostname với PG.
-NodePool cần cho phép Linux/amd64 và có limits đủ; nếu NodePool có taint riêng, bổ sung toleration tương ứng cho PG và fio.
+Sau khi StorageClass đã có, user deploy chỉ cần Secret và `psql.yaml` ở namespace này.
+
+Không cần gắn label thủ công. Karpenter provision node phù hợp 24 CPU / 48 GiB cho PG; mỗi pod benchmark SQL/fio cần thêm 4 CPU / 2 GiB và có affinity bắt buộc cùng hostname với PG để mount PVC data RWO.
+NodePool cần cho phép Linux/amd64 và có limits đủ; nếu NodePool có taint riêng, bổ sung toleration tương ứng cho PG và các job benchmark.
 StorageClass có `WaitForFirstConsumer`, vì vậy **hai volume sẽ được tạo cùng AZ** của node được chọn.
 [Karpenter scheduling](https://karpenter.sh/docs/concepts/scheduling/).
 
-Tạo namespace và password **một lần**; không dùng password database thật:
+Tạo password **một lần** trong namespace đã có; không dùng password database thật:
 
 ```bash
-kubectl create namespace postgres-benchmark --dry-run=client -o yaml | kubectl apply -f -
 (
   set -eu
   umask 077
@@ -82,9 +87,6 @@ kubectl create namespace postgres-benchmark --dry-run=client -o yaml | kubectl a
 kubectl apply -f psql.yaml
 kubectl -n postgres-benchmark rollout status statefulset/postgres --timeout=15m
 kubectl -n postgres-benchmark get pod,pvc
-kubectl -n postgres-benchmark exec postgres-0 -c postgres -- \
-  readlink -f /var/lib/postgresql/data/pgdata/pg_wal
-# Phải trả về: /var/lib/postgresql/wal/pg_wal
 ```
 
 Nếu Secret đã tồn tại thì giữ nguyên và apply YAML; không chạy lại phần tạo Secret.
@@ -118,8 +120,9 @@ run_test pgbench-on
 run_test fio-ebs
 ```
 
-Đo SQL bằng `kubectl exec` vào container `postgres`, kết nối **127.0.0.1:5432**, không đi qua Service/PgBouncer.
-Client pgbench và server dùng chung giới hạn 24 CPU / 48 GiB. So sánh CPU cần tính cả client.
+Đo SQL từ pod client riêng qua **postgres.postgres-benchmark.svc.cluster.local:5432**; không exec vào pod PG.
+Server giữ 24 CPU / 48 GiB; client dùng riêng 4 CPU / 2 GiB. Kết quả hiện tại có độ trễ mạng qua Service và không hoàn toàn tương đương bài localhost trước đó.
+Có thể đổi env `PGHOST` trong hai CronJob sang địa chỉ IP nội bộ nếu cần; DNS Service ổn định khi pod PG được thay thế.
 Mode chỉ áp dụng cho session benchmark qua `PGOPTIONS`; default server vẫn `off` sau mỗi bài.
 Với một primary và không standby, `on` và `local` đều chờ WAL flush trên primary.
 `wal_level=minimal`, `max_wal_senders=0` giống cấu hình LPEX: bộ này dành cho test một node.
@@ -127,7 +130,6 @@ Với một primary và không standby, `on` và `local` đều chờ WAL flush 
 Các job dùng chung `flock` trên PVC, nên SQL off/on và fio không chạy đồng thời dù tạo job cùng lúc.
 `concurrencyPolicy=Forbid` riêng lẻ không đủ để khóa giữa ba CronJob.
 Job chờ khóa tối đa 30 phút, deadline tổng 60 phút, không tự retry bài ghi dữ liệu.
-Nếu kết nối exec bị mất, tiến trình trong PG có thể tiếp tục; kiểm tra process và khóa trước khi chạy lại.
 Không xóa `.benchmark.lock` khi có tiến trình giữ khóa.
 [CronJob concurrency](https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/#concurrency-policy).
 
@@ -143,7 +145,8 @@ Lịch mặc định 00:00 / 01:00 / 02:00 theo `Asia/Ho_Chi_Minh`; khóa vẫn 
 Không tạo job lặp lại trước khi xem trạng thái bài trước.
 Job/pod benchmark tự xóa sau 24 giờ kể từ khi kết thúc; report trên PVC vẫn giữ nguyên.
 
-Kết quả lưu trên PVC trong `/var/lib/postgresql/data/benchmark-results/`:
+Kết quả lưu trên PVC trong `/var/lib/postgresql/data/benchmark-results/`; bảng TPS/latency cũng có trong log Job.
+Lệnh copy report dưới đây là tùy chọn và cần user có quyền `pods/exec`; CronJob không dùng quyền này:
 
 ```bash
 kubectl -n postgres-benchmark cp -c postgres \
@@ -154,7 +157,7 @@ kubectl -n postgres-benchmark top pod postgres-0 --containers
 Report SQL gồm TPS/latency/WAL MB/s, xác nhận commit mode, số dòng/20 index, log init/clean và `database.jsonl`.
 `container-resources.log` ghi CPU tích lũy, RAM và I/O cgroup mỗi giây; database/WAL/wait events lấy mỗi 5 giây.
 `memory.current` gồm cache; `memory.stat` giúp phân biệt anon/file. Cgroup v1 có bộ đếm CPU/RAM/blkio tương ứng.
-CPU cgroup ở đây đo toàn bộ container PG, bao gồm pgbench; WAL counters toàn instance.
+CPU/RAM/I/O cgroup của report SQL đo **container client**, không phải server PG. Dùng `kubectl top pod postgres-0 --containers` (nếu có Metrics Server) hoặc giám sát node/pod để xem CPU/RAM server; exporter cung cấp số liệu database. WAL counters vẫn là toàn instance server.
 Không coi I/O cgroup là số liệu riêng của EBS khi có nhiều thiết bị.
 Exporter: `http://postgres-exporter.postgres-benchmark.svc.cluster.local:9187/metrics`.
 DNS kết nối từ pod khác: `postgres.postgres-benchmark.svc.cluster.local:5432`, database/user `postgres`, password từ Secret `postgres-auth`.
@@ -178,8 +181,8 @@ Script nằm trong `scripts/`, bản thực thi đã nhúng vào YAML. Nếu s�
 
 ## Kiểm tra trước bàn giao
 
-Đã kiểm tra schema Kubernetes 1.34 bằng kubeconform strict: toàn bộ 14 object trong `psql.yaml` hợp lệ.
-Đã smoke-test PostgreSQL 16 trong Docker bằng UID 999, drop capabilities: off/on với 200 dòng, đủ 20 index, một client / một giây; default vẫn off và cleanup thành công.
+Đã kiểm tra schema Kubernetes 1.34 bằng kubeconform strict: toàn bộ 9 object trong `psql.yaml` hợp lệ.
+Đã smoke-test pod client PostgreSQL 16 riêng qua DNS Docker nội bộ, UID 999, drop capabilities: off/on với 200 dòng, đủ 20 index, một client / một giây; default server vẫn off và cleanup thành công. Client không gọi Kubernetes API hay mount volume WAL.
 Đã kiểm tra WAL symlink sang volume riêng và khóa giữa hai container cùng volume data. Bản fio hiện tại chỉ mount ổ data; đã smoke-test bảy report fio, monitor CPU/RAM/I/O và xóa scratch mà không cần volume WAL.
 Smoke fio dùng file nhỏ, một giây và giả lập amd64 trên máy local; **không dùng các số đó làm kết quả hiệu năng EBS**.
 Chưa apply lên EKS, nên việc provision volume, IAM thực tế, AZ, capacity của node và admission policy cần được xác nhận khi Đại ca apply.

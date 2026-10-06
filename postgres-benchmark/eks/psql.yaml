@@ -1,23 +1,5 @@
-# PostgreSQL + io2 EBS + suspended benchmark CronJobs. Create postgres-auth first; see README.md.
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: postgres-benchmark
----
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: postgres-io2
-provisioner: ebs.csi.aws.com
-parameters:
-  type: io2
-  iops: '32000'
-  encrypted: 'true'
-  csi.storage.k8s.io/fstype: ext4
-reclaimPolicy: Retain
-volumeBindingMode: WaitForFirstConsumer
-allowVolumeExpansion: true
+# Namespace postgres-benchmark, StorageClass postgres-io2 and Secret postgres-auth must exist.
+# SQL clients connect over Service DNS; no Kubernetes RBAC resources or API token.
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -487,21 +469,6 @@ data:
     run randwrite-8k "${common[@]}" --rw=randwrite --bs=8k --runtime="$runtime" --time_based
     run fsync-test --directory="$scratch" --filename=fsync.bin --ioengine=sync --rw=write --bs=8k --size="$fsync_size" --fdatasync=1 --runtime="$runtime" --time_based --output-format=json
     run mixed "${common[@]}" --rw=randrw --rwmixread=70 --bs=8k --runtime="$mixed_runtime" --time_based
-  run-job.sh: |
-    #!/usr/bin/env bash
-    set -euo pipefail
-    mode="${1:?Expected off or on}"
-    case "$mode" in off|on) ;; *) exit 1;; esac
-    namespace="${POD_NAMESPACE:?}"
-    ready=false
-    for ((attempt=0; attempt<60; attempt++)); do
-      if [ "$(kubectl get pod postgres-0 -n "$namespace" -o jsonpath='{.status.containerStatuses[?(@.name=="postgres")].ready}')" = true ]; then
-        ready=true; break
-      fi
-      sleep 5
-    done
-    [ "$ready" = true ] || { echo 'postgres-0 was not ready within 300 seconds' >&2; exit 1; }
-    exec kubectl exec -n "$namespace" postgres-0 -c postgres -- bash /opt/benchmark/run-pg.sh "$mode"
   run-pg.sh: |
     #!/usr/bin/env bash
     set -euo pipefail
@@ -513,8 +480,9 @@ data:
     exec 9> "$root/.benchmark.lock"
     echo "Waiting for shared benchmark lock ($mode)"
     flock -w 1800 9
-    unset PGOPTIONS PGSERVICE PGSERVICEFILE PGPASSFILE
-    export PGHOST=127.0.0.1 PGPORT=5432 PGUSER=postgres PGDATABASE=postgres PGSSLMODE=disable
+    unset PGHOSTADDR PGOPTIONS PGSERVICE PGSERVICEFILE PGPASSFILE
+    export PGHOST="${PGHOST:-postgres.postgres-benchmark.svc.cluster.local}" PGPORT="${PGPORT:-5432}"
+    export PGUSER="${PGUSER:-postgres}" PGDATABASE="${PGDATABASE:-postgres}" PGSSLMODE=disable PGCONNECT_TIMEOUT=5
     export PGPASSWORD="$(cat "${POSTGRES_PASSWORD_FILE:?}")"
     mkdir -p "$root/benchmark-results"
     result="$(mktemp -d "$root/benchmark-results/pg-$mode-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
@@ -537,16 +505,18 @@ data:
     trap finish EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    ready=false
+    for ((attempt=0; attempt<60; attempt++)); do
+      if pg_isready -q -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -t 5; then ready=true; break; fi
+      sleep 5
+    done
+    [ "$ready" = true ] || { echo 'PostgreSQL endpoint was not ready' >&2; exit 1; }
     {
       date -u +%FT%TZ
       pgbench --version
       psql -X -At -c 'SELECT version(); SHOW synchronous_commit; SHOW fsync; SHOW full_page_writes;'
-      echo "pg_wal -> $(readlink -f "${PGDATA:?}/pg_wal")"
-      [ "$(readlink -f "$PGDATA/pg_wal")" = /var/lib/postgresql/wal/pg_wal ] || {
-        echo 'Expected WAL on separate WAL volume; refusing benchmark' >&2; exit 1;
-      }
+      echo "Endpoint: $PGHOST:$PGPORT/$PGDATABASE"
       df -h "$root"
-      df -h /var/lib/postgresql/wal
       cat /proc/self/mountinfo
     } > "$result/environment.txt"
     bash "$scripts/monitor_db.sh" > "$result/database.jsonl" 2> "$result/database-monitor.log" &
@@ -765,9 +735,6 @@ spec:
           readOnly: true
         - name: shm
           mountPath: /dev/shm
-        - name: scripts
-          mountPath: /opt/benchmark
-          readOnly: true
         - name: wal
           mountPath: /var/lib/postgresql/wal
         startupProbe:
@@ -876,10 +843,6 @@ spec:
           items:
           - key: monitor-password
             path: monitor-password
-      - name: scripts
-        configMap:
-          name: benchmark-scripts
-          defaultMode: 365
   volumeClaimTemplates:
   - metadata:
       name: data
@@ -905,50 +868,6 @@ spec:
       resources:
         requests:
           storage: 100Gi
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: benchmark-runner
-  namespace: postgres-benchmark
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: benchmark-runner
-  namespace: postgres-benchmark
-rules:
-- apiGroups:
-  - ''
-  resources:
-  - pods
-  resourceNames:
-  - postgres-0
-  verbs:
-  - get
-- apiGroups:
-  - ''
-  resources:
-  - pods/exec
-  resourceNames:
-  - postgres-0
-  verbs:
-  - get
-  - create
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: benchmark-runner
-  namespace: postgres-benchmark
-subjects:
-- kind: ServiceAccount
-  name: benchmark-runner
-  namespace: postgres-benchmark
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: benchmark-runner
 ---
 apiVersion: batch/v1
 kind: CronJob
@@ -977,7 +896,7 @@ spec:
             sidecar.istio.io/inject: 'false'
         spec:
           restartPolicy: Never
-          automountServiceAccountToken: true
+          automountServiceAccountToken: false
           securityContext:
             runAsNonRoot: true
             runAsUser: 999
@@ -988,17 +907,17 @@ spec:
               type: RuntimeDefault
           containers:
           - name: benchmark
-            image: alpine/k8s:1.35.0@sha256:18bc02c1e0df04451f4f9194eb7b7341c1165da5495459b52f85f72fb9545032
+            image: postgres:16@sha256:65b16a8b326e0cfbdf33fa7e783f2a0cb352a61448616ccccfd616ef42aa0f65
             command:
             - /bin/bash
-            - /opt/benchmark/run-job.sh
+            - /opt/benchmark/run-pg.sh
             resources:
               requests:
-                cpu: 100m
-                memory: 64Mi
+                cpu: '4'
+                memory: 2Gi
               limits:
-                cpu: 500m
-                memory: 256Mi
+                cpu: '4'
+                memory: 2Gi
             securityContext:
               allowPrivilegeEscalation: false
               capabilities:
@@ -1008,22 +927,51 @@ spec:
             - name: scripts
               mountPath: /opt/benchmark
               readOnly: true
+            - name: auth
+              mountPath: /run/postgres-secrets
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/postgresql/data
             args:
             - 'off'
             env:
-            - name: HOME
-              value: /tmp
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
+            - name: PGHOST
+              value: postgres.postgres-benchmark.svc.cluster.local
+            - name: PGPORT
+              value: '5432'
+            - name: PGUSER
+              value: postgres
+            - name: PGDATABASE
+              value: postgres
+            - name: POSTGRES_PASSWORD_FILE
+              value: /run/postgres-secrets/postgres-password
           volumes:
           - name: scripts
             configMap:
               name: benchmark-scripts
               defaultMode: 365
+          - name: data
+            persistentVolumeClaim:
+              claimName: data-postgres-0
+          - name: auth
+            secret:
+              secretName: postgres-auth
+              defaultMode: 288
+              items:
+              - key: postgres-password
+                path: postgres-password
           terminationGracePeriodSeconds: 120
-          serviceAccountName: benchmark-runner
+          nodeSelector:
+            kubernetes.io/os: linux
+            kubernetes.io/arch: amd64
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: postgres
+                    app.kubernetes.io/part-of: postgres-ebs-test
+                topologyKey: kubernetes.io/hostname
 ---
 apiVersion: batch/v1
 kind: CronJob
@@ -1052,7 +1000,7 @@ spec:
             sidecar.istio.io/inject: 'false'
         spec:
           restartPolicy: Never
-          automountServiceAccountToken: true
+          automountServiceAccountToken: false
           securityContext:
             runAsNonRoot: true
             runAsUser: 999
@@ -1063,17 +1011,17 @@ spec:
               type: RuntimeDefault
           containers:
           - name: benchmark
-            image: alpine/k8s:1.35.0@sha256:18bc02c1e0df04451f4f9194eb7b7341c1165da5495459b52f85f72fb9545032
+            image: postgres:16@sha256:65b16a8b326e0cfbdf33fa7e783f2a0cb352a61448616ccccfd616ef42aa0f65
             command:
             - /bin/bash
-            - /opt/benchmark/run-job.sh
+            - /opt/benchmark/run-pg.sh
             resources:
               requests:
-                cpu: 100m
-                memory: 64Mi
+                cpu: '4'
+                memory: 2Gi
               limits:
-                cpu: 500m
-                memory: 256Mi
+                cpu: '4'
+                memory: 2Gi
             securityContext:
               allowPrivilegeEscalation: false
               capabilities:
@@ -1083,22 +1031,51 @@ spec:
             - name: scripts
               mountPath: /opt/benchmark
               readOnly: true
+            - name: auth
+              mountPath: /run/postgres-secrets
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/postgresql/data
             args:
             - 'on'
             env:
-            - name: HOME
-              value: /tmp
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
+            - name: PGHOST
+              value: postgres.postgres-benchmark.svc.cluster.local
+            - name: PGPORT
+              value: '5432'
+            - name: PGUSER
+              value: postgres
+            - name: PGDATABASE
+              value: postgres
+            - name: POSTGRES_PASSWORD_FILE
+              value: /run/postgres-secrets/postgres-password
           volumes:
           - name: scripts
             configMap:
               name: benchmark-scripts
               defaultMode: 365
+          - name: data
+            persistentVolumeClaim:
+              claimName: data-postgres-0
+          - name: auth
+            secret:
+              secretName: postgres-auth
+              defaultMode: 288
+              items:
+              - key: postgres-password
+                path: postgres-password
           terminationGracePeriodSeconds: 120
-          serviceAccountName: benchmark-runner
+          nodeSelector:
+            kubernetes.io/os: linux
+            kubernetes.io/arch: amd64
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: postgres
+                    app.kubernetes.io/part-of: postgres-ebs-test
+                topologyKey: kubernetes.io/hostname
 ---
 apiVersion: batch/v1
 kind: CronJob

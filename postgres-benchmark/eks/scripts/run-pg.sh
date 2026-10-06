@@ -8,8 +8,9 @@ scripts="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 exec 9> "$root/.benchmark.lock"
 echo "Waiting for shared benchmark lock ($mode)"
 flock -w 1800 9
-unset PGOPTIONS PGSERVICE PGSERVICEFILE PGPASSFILE
-export PGHOST=127.0.0.1 PGPORT=5432 PGUSER=postgres PGDATABASE=postgres PGSSLMODE=disable
+unset PGHOSTADDR PGOPTIONS PGSERVICE PGSERVICEFILE PGPASSFILE
+export PGHOST="${PGHOST:-postgres.postgres-benchmark.svc.cluster.local}" PGPORT="${PGPORT:-5432}"
+export PGUSER="${PGUSER:-postgres}" PGDATABASE="${PGDATABASE:-postgres}" PGSSLMODE=disable PGCONNECT_TIMEOUT=5
 export PGPASSWORD="$(cat "${POSTGRES_PASSWORD_FILE:?}")"
 mkdir -p "$root/benchmark-results"
 result="$(mktemp -d "$root/benchmark-results/pg-$mode-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
@@ -32,16 +33,18 @@ finish() {
 trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+ready=false
+for ((attempt=0; attempt<60; attempt++)); do
+  if pg_isready -q -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -t 5; then ready=true; break; fi
+  sleep 5
+done
+[ "$ready" = true ] || { echo 'PostgreSQL endpoint was not ready' >&2; exit 1; }
 {
   date -u +%FT%TZ
   pgbench --version
   psql -X -At -c 'SELECT version(); SHOW synchronous_commit; SHOW fsync; SHOW full_page_writes;'
-  echo "pg_wal -> $(readlink -f "${PGDATA:?}/pg_wal")"
-  [ "$(readlink -f "$PGDATA/pg_wal")" = /var/lib/postgresql/wal/pg_wal ] || {
-    echo 'Expected WAL on separate WAL volume; refusing benchmark' >&2; exit 1;
-  }
+  echo "Endpoint: $PGHOST:$PGPORT/$PGDATABASE"
   df -h "$root"
-  df -h /var/lib/postgresql/wal
   cat /proc/self/mountinfo
 } > "$result/environment.txt"
 bash "$scripts/monitor_db.sh" > "$result/database.jsonl" 2> "$result/database-monitor.log" &
