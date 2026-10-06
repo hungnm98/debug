@@ -7,13 +7,13 @@
 | Driver | `ebs.csi.aws.com` — EBS CSI add-on + IRSA đang có |
 | StorageClass | `postgres-io2` |
 | Loại | `io2` Block Express |
-| Dung lượng | 100 GiB |
-| Provisioned IOPS | 32.000 |
+| Data | PVC `data-postgres-0`: **100 GiB / 32.000 IOPS** |
+| WAL | PVC `wal-postgres-0`: **100 GiB / 32.000 IOPS**, volume riêng |
 | Filesystem / encryption | ext4 / bật mã hóa bằng khóa EBS mặc định |
 | Binding / reclaim | `WaitForFirstConsumer` / `Retain` |
 
 AWS hiện cấp mọi volume io2 bằng Block Express; không cần parameter `blockExpress`.
-io2 có trần 256.000 IOPS / 4.000 MiB/s trên Nitro, nhưng **32.000 IOPS là cấu hình của manifest này**.
+io2 có trần 256.000 IOPS / 4.000 MiB/s trên Nitro, nhưng **32.000 IOPS trên mỗi ổ là cấu hình của manifest này**.
 Muốn 256.000 IOPS cần ít nhất 256 GiB và node có đủ giới hạn EBS; không tự động đạt mức đó khi chọn io2.
 Không đặt parameter `throughput` của gp3 vào StorageClass io2.
 
@@ -23,8 +23,9 @@ Nguồn: [AWS io2](https://docs.aws.amazon.com/ebs/latest/userguide/provisioned-
 
 Chọn **node EC2 Nitro x86_64**, có ít nhất 32 vCPU và đủ RAM allocatable cho PG 48 GiB + fio 2 GiB + hệ thống.
 Ví dụ `r6in.8xlarge`: 32 vCPU / 256 GiB, EBS baseline 100.000 IOPS và 3.125 MB/s.
-Đây là gợi ý; manifest không tạo node hay khóa instance type. Đại ca chưa cung cấp loại node thực tế.
-Giới hạn EBS của instance dùng chung cho các volume gắn vào node, gồm cả root disk.
+Đây là gợi ý; Karpenter tự cấp node theo resource requests và NodePool hiện có. Manifest chỉ chọn Linux/amd64, không cần label `remi=debug`, không khóa hostname hoặc instance type.
+Giới hạn EBS của instance dùng chung cho các volume gắn vào node, gồm cả root disk. Để khai thác đồng thời hai ổ 32.000 IOPS, cần node có EBS baseline ít nhất 64.000 IOPS cộng phần I/O của root disk/workload khác.
+Karpenter không chọn IOPS EBS theo resource requests CPU/RAM; cần kiểm tra instance thực tế sau khi scale. Nếu cần bảo đảm loại node, giới hạn instance type trong NodePool theo bảng AWS.
 [Thông số EC2](https://docs.aws.amazon.com/ec2/latest/instancetypes/mo.html).
 
 ## Nội dung psql.yaml
@@ -36,9 +37,10 @@ Không sửa file triển khai LPEX cũ.
 - Namespace `postgres-benchmark`, một StatefulSet `postgres`, một replica.
 - PostgreSQL 16: request/limit **24 CPU / 48 GiB**, cùng cấu hình LPEX: `shared_buffers=12GB`, `effective_cache_size=36GB`, `synchronous_commit=off`, `fsync=on` và `full_page_writes=on` mặc định PostgreSQL.
 - Exporter sidecar trong cùng pod: 100m CPU / 256 MiB, metrics cổng 9187.
-- Một PVC `data-postgres-0`, 100 GiB io2; PGDATA ở `/var/lib/postgresql/data/pgdata`.
+- Hai PVC io2 riêng, mỗi PVC 100 GiB / 32.000 IOPS: data `data-postgres-0` và WAL `wal-postgres-0`.
+- PGDATA ở `/var/lib/postgresql/data/pgdata`; `POSTGRES_INITDB_WALDIR=/var/lib/postgresql/wal/pg_wal` tạo symlink `PGDATA/pg_wal` sang volume WAL riêng ngay lúc initdb.
 - Hai CronJob `pgbench-off`, `pgbench-on`: tạo 2 triệu dòng và 20 index, chạy lần lượt 1 / 16 / 64 clients, mỗi mức 120 giây, rồi xóa bảng test.
-- CronJob `fio-ebs`: cùng PVC, cùng node với PostgreSQL; ghi file tạm ngoài PGDATA. RWO cho phép nhiều pod cùng node mount volume.
+- CronJob `fio-ebs`: mount cả hai PVC, cùng node với PostgreSQL; đo toàn bộ bài trên **data trước, WAL sau**. File tạm ngoài PGDATA và ngoài thư mục `pg_wal`. RWO cho phép nhiều pod cùng node mount volume.
 - Service nội bộ; không Ingress, certificate hoặc NetworkPolicy. Không thêm PgBouncer vào bài đo trực tiếp này.
 
 Các image chính được khóa digest. Image kubectl 1.35 phù hợp API server 1.34–1.36 theo chính sách lệch một minor.
@@ -54,13 +56,13 @@ kubectl config current-context
 kubectl get nodes -o wide
 kubectl -n kube-system get deployment ebs-csi-controller
 kubectl get csidriver ebs.csi.aws.com
-kubectl label node <TEN_NODE_EC2_NITRO> remi=debug --overwrite
-kubectl get nodes -l remi=debug
+kubectl get nodepools
 ```
 
-Chỉ gắn label cho node định dùng benchmark. Manifest chọn `remi=debug`, Linux, amd64; fio có affinity bắt buộc cùng hostname với PG.
-StorageClass có `WaitForFirstConsumer`, vì vậy volume sẽ được tạo đúng AZ của node được chọn.
-Nếu node có taint khác `remi=debug:NoSchedule`, bổ sung toleration tương ứng cho PG và fio.
+Không cần gắn label thủ công. Karpenter provision node phù hợp 24 CPU / 48 GiB cho PG; fio cần thêm 4 CPU / 2 GiB và có affinity bắt buộc cùng hostname với PG.
+NodePool cần cho phép Linux/amd64 và có limits đủ; nếu NodePool có taint riêng, bổ sung toleration tương ứng cho PG và fio.
+StorageClass có `WaitForFirstConsumer`, vì vậy **hai volume sẽ được tạo cùng AZ** của node được chọn.
+[Karpenter scheduling](https://karpenter.sh/docs/concepts/scheduling/).
 
 Tạo namespace và password **một lần**; không dùng password database thật:
 
@@ -80,12 +82,19 @@ kubectl create namespace postgres-benchmark --dry-run=client -o yaml | kubectl a
 kubectl apply -f psql.yaml
 kubectl -n postgres-benchmark rollout status statefulset/postgres --timeout=15m
 kubectl -n postgres-benchmark get pod,pvc
+kubectl -n postgres-benchmark exec postgres-0 -c postgres -- \
+  readlink -f /var/lib/postgresql/data/pgdata/pg_wal
+# Phải trả về: /var/lib/postgresql/wal/pg_wal
 ```
 
 Nếu Secret đã tồn tại thì giữ nguyên và apply YAML; không chạy lại phần tạo Secret.
 PG chỉ đọc password khi init volume mới; thay Secret không tự đổi password của database đã có dữ liệu.
 PVC và EBS đều `Retain`: xóa StatefulSet/namespace không tự xóa EBS; cần tự dọn volume để ngừng tính phí.
-100 GiB và 32.000 IOPS io2 đều tính phí; mức tiền phụ thuộc region và thời gian giữ volume.
+Hai ổ cộng lại **200 GiB và 64.000 provisioned IOPS** đều tính phí; mức tiền phụ thuộc region và thời gian giữ volume.
+
+Bản hai PVC dành cho deploy mới. Nếu đã apply bản một PVC, không apply trực tiếp lên StatefulSet cũ: `volumeClaimTemplates` không sửa được tại chỗ và `POSTGRES_INITDB_WALDIR` chỉ có tác dụng khi initdb mới.
+Giữ nguyên dữ liệu cũ; cần quy trình recreate StatefulSet và di chuyển WAL khi PostgreSQL đã dừng, hoặc deploy trong namespace mới. Không chỉ đổi env rồi coi WAL đã chuyển ổ.
+[PostgreSQL WAL directory](https://www.postgresql.org/docs/16/wal-internals.html).
 
 ## Chạy từng bài và lấy kết quả
 
@@ -93,7 +102,7 @@ Ba CronJob mặc định **suspend=true**. Chạy thủ công để xem kết qu
 
 ```bash
 run_test() {
-  local job="${1}-$(date +%s)"
+  local cron="$1" job="${1}-$(date +%s)"
   kubectl -n postgres-benchmark create job "$job" --from="cronjob/$cron" || return
   kubectl -n postgres-benchmark wait --for=condition=complete "job/$job" --timeout=65m || {
     kubectl -n postgres-benchmark logs "job/$job" --all-containers=true
@@ -152,13 +161,14 @@ DNS kết nối từ pod khác: `postgres.postgres-benchmark.svc.cluster.local:5
 
 ## Bài fio
 
-Chạy tuần tự: pre-write 40 GiB → randread 4k → randwrite 4k → randread 8k → randwrite 8k → fdatasync → mixed.
+Chạy toàn bộ chuỗi trên ổ **data**, dọn scratch rồi mới chạy lại trên ổ **WAL**; không đo hai ổ đồng thời.
+Mỗi ổ chạy tuần tự: pre-write 40 GiB → randread 4k → randwrite 4k → randread 8k → randwrite 8k → fdatasync → mixed.
 Pre-write ghi đủ mọi block để random read không đo các extent chưa ghi.
 Bốn bài random dùng libaio/direct, 4 jobs × 10 GiB, iodepth 32, mỗi bài 60s.
 Fsync dùng sync/write, 8k, 2 GiB, fdatasync mỗi block, 60s.
 Mixed dùng 8k, 70% read / 30% write, 4 jobs, iodepth 32, 300s.
-Các file riêng nằm trong `.fio-*`, tự xóa khi bài kết thúc; giữ JSON kết quả gồm IOPS, bandwidth và latency percentiles.
-Cần tối thiểu 52 GiB trống trước khi chạy; nếu WAL/data làm đầy PVC, tăng dung lượng trước.
+Các file riêng nằm trong `.fio-*` ở gốc từng PVC, tự xóa khi bài kết thúc; giữ JSON kết quả gồm IOPS, bandwidth và latency percentiles trong các thư mục report `data/` và `wal/` trên PVC data.
+Cần tối thiểu 52 GiB trống **trên mỗi ổ** trước khi chạy; nếu WAL/data làm đầy PVC, tăng dung lượng trước.
 Không ghi block device và không đụng file PostgreSQL. Khi pod bị kill cứng, kiểm tra và dọn **đúng thư mục `.fio-*` của bài đã chết** trước khi chạy lại.
 PG vẫn bật nhưng không chạy benchmark SQL cùng lúc; checkpoint/autovacuum hoặc workload ngoài bộ test vẫn có thể ảnh hưởng I/O.
 Để so sánh, dùng node riêng và dừng các client khác.
@@ -170,6 +180,6 @@ Script nằm trong `scripts/`, bản thực thi đã nhúng vào YAML. Nếu s�
 
 Đã kiểm tra schema Kubernetes 1.34 bằng kubeconform strict: toàn bộ 14 object trong `psql.yaml` hợp lệ.
 Đã smoke-test PostgreSQL 16 trong Docker bằng UID 999, drop capabilities: off/on với 200 dòng, đủ 20 index, một client / một giây; default vẫn off và cleanup thành công.
-Đã kiểm tra khóa giữa hai container cùng volume, cả bảy report fio (pre-write + sáu bài), monitor CPU/RAM/I/O và xóa scratch.
+Đã kiểm tra WAL symlink sang volume riêng, khóa giữa hai container cùng volume data, cả 14 report fio (bảy bài × hai ổ) chạy data rồi WAL, monitor CPU/RAM/I/O và xóa scratch trên cả hai ổ.
 Smoke fio dùng file nhỏ, một giây và giả lập amd64 trên máy local; **không dùng các số đó làm kết quả hiệu năng EBS**.
 Chưa apply lên EKS, nên việc provision volume, IAM thực tế, AZ, capacity của node và admission policy cần được xác nhận khi Đại ca apply.

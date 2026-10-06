@@ -36,7 +36,12 @@ trap 'exit 143' TERM
   date -u +%FT%TZ
   pgbench --version
   psql -X -At -c 'SELECT version(); SHOW synchronous_commit; SHOW fsync; SHOW full_page_writes;'
+  echo "pg_wal -> $(readlink -f "${PGDATA:?}/pg_wal")"
+  [ "$(readlink -f "$PGDATA/pg_wal")" = /var/lib/postgresql/wal/pg_wal ] || {
+    echo 'Expected WAL on separate WAL volume; refusing benchmark' >&2; exit 1;
+  }
   df -h "$root"
+  df -h /var/lib/postgresql/wal
   cat /proc/self/mountinfo
 } > "$result/environment.txt"
 bash "$scripts/monitor_db.sh" > "$result/database.jsonl" 2> "$result/database-monitor.log" &
