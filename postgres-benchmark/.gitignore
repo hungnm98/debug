@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+.pgpass
+*.pgpass
+.pgpass.*
+!.pgpass.example
+certs/
+pgbench-results/
+*.log
+*.jsonl
