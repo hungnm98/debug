@@ -40,7 +40,7 @@ Không sửa file triển khai LPEX cũ.
 - Hai PVC io2 riêng, mỗi PVC 100 GiB / 32.000 IOPS: data `data-postgres-0` và WAL `wal-postgres-0`.
 - PGDATA ở `/var/lib/postgresql/data/pgdata`; `POSTGRES_INITDB_WALDIR=/var/lib/postgresql/wal/pg_wal` tạo symlink `PGDATA/pg_wal` sang volume WAL riêng ngay lúc initdb.
 - Hai CronJob `pgbench-off`, `pgbench-on`: tạo 2 triệu dòng và 20 index, chạy lần lượt 1 / 16 / 64 clients, mỗi mức 120 giây, rồi xóa bảng test.
-- CronJob `fio-ebs`: mount cả hai PVC, cùng node với PostgreSQL; đo toàn bộ bài trên **data trước, WAL sau**. File tạm ngoài PGDATA và ngoài thư mục `pg_wal`. RWO cho phép nhiều pod cùng node mount volume.
+- CronJob `fio-ebs`: chỉ mount PVC data, cùng node với PostgreSQL; đo ổ data bằng file tạm ngoài PGDATA. RWO cho phép nhiều pod cùng node mount volume.
 - Service nội bộ; không Ingress, certificate hoặc NetworkPolicy. Không thêm PgBouncer vào bài đo trực tiếp này.
 
 Các image chính được khóa digest. Image kubectl 1.35 phù hợp API server 1.34–1.36 theo chính sách lệch một minor.
@@ -161,14 +161,14 @@ DNS kết nối từ pod khác: `postgres.postgres-benchmark.svc.cluster.local:5
 
 ## Bài fio
 
-Chạy toàn bộ chuỗi trên ổ **data**, dọn scratch rồi mới chạy lại trên ổ **WAL**; không đo hai ổ đồng thời.
-Mỗi ổ chạy tuần tự: pre-write 40 GiB → randread 4k → randwrite 4k → randread 8k → randwrite 8k → fdatasync → mixed.
+Chỉ đo ổ **data**; CronJob fio không mount PVC WAL.
+Chạy tuần tự: pre-write 40 GiB → randread 4k → randwrite 4k → randread 8k → randwrite 8k → fdatasync → mixed.
 Pre-write ghi đủ mọi block để random read không đo các extent chưa ghi.
 Bốn bài random dùng libaio/direct, 4 jobs × 10 GiB, iodepth 32, mỗi bài 60s.
 Fsync dùng sync/write, 8k, 2 GiB, fdatasync mỗi block, 60s.
 Mixed dùng 8k, 70% read / 30% write, 4 jobs, iodepth 32, 300s.
-Các file riêng nằm trong `.fio-*` ở gốc từng PVC, tự xóa khi bài kết thúc; giữ JSON kết quả gồm IOPS, bandwidth và latency percentiles trong các thư mục report `data/` và `wal/` trên PVC data.
-Cần tối thiểu 52 GiB trống **trên mỗi ổ** trước khi chạy; nếu WAL/data làm đầy PVC, tăng dung lượng trước.
+Các file riêng nằm trong `.fio-*` ở gốc PVC data, tự xóa khi bài kết thúc; giữ JSON kết quả gồm IOPS, bandwidth và latency percentiles trong thư mục report `data/` trên PVC data.
+Cần tối thiểu 52 GiB trống **trên ổ data** trước khi chạy; nếu data làm đầy PVC, tăng dung lượng trước.
 Không ghi block device và không đụng file PostgreSQL. Khi pod bị kill cứng, kiểm tra và dọn **đúng thư mục `.fio-*` của bài đã chết** trước khi chạy lại.
 PG vẫn bật nhưng không chạy benchmark SQL cùng lúc; checkpoint/autovacuum hoặc workload ngoài bộ test vẫn có thể ảnh hưởng I/O.
 Để so sánh, dùng node riêng và dừng các client khác.
@@ -180,6 +180,6 @@ Script nằm trong `scripts/`, bản thực thi đã nhúng vào YAML. Nếu s�
 
 Đã kiểm tra schema Kubernetes 1.34 bằng kubeconform strict: toàn bộ 14 object trong `psql.yaml` hợp lệ.
 Đã smoke-test PostgreSQL 16 trong Docker bằng UID 999, drop capabilities: off/on với 200 dòng, đủ 20 index, một client / một giây; default vẫn off và cleanup thành công.
-Đã kiểm tra WAL symlink sang volume riêng, khóa giữa hai container cùng volume data, cả 14 report fio (bảy bài × hai ổ) chạy data rồi WAL, monitor CPU/RAM/I/O và xóa scratch trên cả hai ổ.
+Đã kiểm tra WAL symlink sang volume riêng và khóa giữa hai container cùng volume data. Bản fio hiện tại chỉ mount ổ data; đã smoke-test bảy report fio, monitor CPU/RAM/I/O và xóa scratch mà không cần volume WAL.
 Smoke fio dùng file nhỏ, một giây và giả lập amd64 trên máy local; **không dùng các số đó làm kết quả hiệu năng EBS**.
 Chưa apply lên EKS, nên việc provision volume, IAM thực tế, AZ, capacity của node và admission policy cần được xác nhận khi Đại ca apply.
